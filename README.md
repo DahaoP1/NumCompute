@@ -6,7 +6,7 @@ P_AI Assignment 2.2, 2026 S2 — Individual project
 
 A streaming extension of NumCompute built with Python, NumPy and matplotlib. The aim is to process incoming CSV chunks, update preprocessing and statistics, train a single decision tree through buffered retraining, and track evaluation results over time.
 
-**Current status: project structure initialised.** The files in `numcompute_stream/`, the streaming tests, notebook and benchmark scripts are placeholders. The streaming APIs and examples below describe the intended implementation and are not runnable yet.
+**Current status: decision tree implemented.** `numcompute_stream/tree.py` supports batch training, prediction and buffered retraining. Other streaming modules, the demo notebook and benchmark scripts remain placeholders. The decision-tree example below is runnable; the planned pipeline example still requires the remaining modules.
 
 ## Project structure
 
@@ -21,7 +21,7 @@ NumCompute/
 │   ├── __init__.py
 │   ├── io.py                         # Chunk-wise CSV input
 │   ├── preprocessing.py              # Incremental scaling, filling and encoding
-│   ├── tree.py                       # Decision tree with buffered retraining
+│   ├── tree.py                       # Implemented: decision tree and buffered retraining
 │   ├── stream.py                     # StreamTrainer and per-chunk logs
 │   ├── stats.py                      # Incremental statistics
 │   ├── metrics.py                    # Cumulative and rolling-window metrics
@@ -76,7 +76,7 @@ The intended workflow is:
 5. Record chunk metrics, cumulative accuracy and memory use.
 6. Plot the recorded results with `visualise.py`.
 
-For evaluation on unseen chunks, prediction and scoring should happen before training on those same records once a trained tree is available. The first prediction before any retraining, and any final incomplete buffer, will need explicitly documented behaviour.
+For evaluation on unseen chunks, prediction and scoring should happen before training on those same records once a trained tree is available. `DecisionTreeClassifier.predict()` raises `RuntimeError` before `fit()` or the first buffer-triggered retraining. A final incomplete buffer remains pending until more chunks arrive. Explicit `fit()` trains from scratch, clears pending samples and resets the buffered retraining counter.
 
 ### Buffered retraining
 
@@ -91,9 +91,27 @@ For example, with `buffer_size=500` and chunks of 200 samples:
 | 3 | 600 | Train on all 600 samples, then clear the buffer. |
 | 4 | 200 | Keep the new samples; continue using the last trained tree. |
 
-## Planned API overview and example
+### Decision-tree example
 
-These tables outline the assignment interfaces. Exact defaults and any additional options will be documented as the implementations are added. `X_chunk` has shape `(n_samples, n_features)` and `y_chunk` has shape `(n_samples,)`.
+The implemented tree accepts numeric features and finite numeric/boolean or nonblank string labels. Numeric feature NaNs are supported: split search tries sending them all left or all right and keeps the better direction. Infinite features and missing labels are rejected.
+
+```python
+from numcompute_stream.tree import DecisionTreeClassifier
+
+tree = DecisionTreeClassifier(max_depth=3, buffer_size=4)
+tree.partial_fit([[20, 40_000], [25, 45_000]], ["Adelaide", "Adelaide"])
+# Only two samples are buffered; prediction is not available yet.
+tree.partial_fit([[45, 110_000], [50, 120_000]], ["Sydney", "Sydney"])
+
+print(tree.predict([[23, 42_000], [48, 115_000]]))  # ['Adelaide' 'Sydney']
+print(tree.n_buffered_samples_, tree.n_retrains_)  # 0 1
+```
+
+Defaults: `max_depth=5`, `min_samples_split=2`, `max_features=None`, `buffer_size=500`, `criterion="gini"`, `random_state=0`. `max_depth=None` allows unrestricted depth; `max_features` is None or a positive integer no greater than the feature count. Gini and entropy are supported. An integer seed makes feature subsampling reproducible. Labels tied for majority use the first sorted class. Split gains within `1e-12` prefer the lower feature index, then lower threshold, then NaNs on the right. A fresh tree uses only the current buffer's samples and classes.
+
+## API overview and planned integration
+
+The tree methods below are implemented. Other entries describe planned assignment interfaces; their exact defaults and any additional options will be documented as they are implemented. `X_chunk` has shape `(n_samples, n_features)` and `y_chunk` has shape `(n_samples,)`.
 
 | Function or method | Parameters | Return | Purpose |
 | --- | --- | --- | --- |
@@ -149,7 +167,7 @@ The original `demo/quickstart.ipynb` and its documentation remain available thro
 
 ## Tests
 
-The target is at least **30 unit tests covering the streaming functionality**. The new `test_stream_*.py` files currently contain no test cases; existing Assignment 2.1 tests remain separate from this target.
+The target is at least **30 unit tests covering the streaming functionality**. `test_stream_tree.py` now covers ordinary learning, an independent loop-based split reference, NaNs, ties, extreme floats, sliced inputs and buffered retraining. Other streaming test files are still placeholders; coverage will expand as their modules are implemented. Existing Assignment 2.1 tests are also retained.
 
 Planned coverage includes:
 
