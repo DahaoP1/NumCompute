@@ -1,8 +1,9 @@
-"""Incremental scalers and imputation for (samples, features) arrays.
+"""Incremental scalers, imputation and categorical encoding for 2-D arrays.
 
 Reuse the original NumCompute transform and fit_transform implementations.
 fit starts afresh; partial_fit learns from all chunks seen so far. NaNs are
-ignored separately in each column. One-hot encoding will be added separately.
+ignored separately in each numeric column. The encoder merges new categories
+per feature and uses the original NumCompute string/missing-value conventions.
 """
 
 import numpy as np
@@ -10,12 +11,13 @@ import numpy as np
 from numcompute.preprocessing import (
     MISSING,
     MinMaxScaler as _BatchMinMaxScaler,
+    OneHotEncoder as _BatchOneHotEncoder,
     SimpleImputer as _BatchSimpleImputer,
     StandardScaler as _BatchStandardScaler,
 )
 from .stats import RunningStats
 
-__all__ = ["StandardScaler", "MinMaxScaler", "SimpleImputer"]
+__all__ = ["StandardScaler", "MinMaxScaler", "SimpleImputer", "OneHotEncoder"]
 
 
 def share_array(X, transformer, reset=False):
@@ -403,4 +405,99 @@ class SimpleImputer(_StreamingFit, _BatchSimpleImputer):
             self._mean = mean
         elif self.strategy == "median":
             self._chunks = chunks
+        return self
+
+
+class OneHotEncoder(_BatchOneHotEncoder):
+    """Expand per-feature categories when new chunks arrive.
+
+    Parameters
+    ----------
+    handle_unknown : {'error', 'ignore'}, default 'error'
+        During transform, raise for an unseen nonmissing category or encode
+        its feature block as zeros. partial_fit always learns new categories.
+
+    Attributes
+    ----------
+    categories_ : list of ndarray of str
+        Sorted unique nonmissing categories, one array per input feature.
+    n_features_in_ : int
+        Number of fitted input columns.
+    n_features_out_ : int
+        Total categories across features; transform returns (b, this value).
+
+    Raises
+    ------
+    ValueError
+        If handle_unknown is invalid, input shape/feature count is invalid,
+        or transform encounters an unknown category under the error policy.
+    RuntimeError
+        If transform is called before a nonempty fit or partial_fit.
+    TypeError
+        If input cannot be converted to strings.
+
+    Notes
+    -----
+    Reuses the original constructor, fit, transform and fit_transform.
+    fit replaces categories; partial_fit merges them without storing rows.
+    All values become strings. '', 'nan' and 'None' are missing and always
+    encode to zeros. Fully missing features contribute no output columns
+    until a valid category arrives. Empty chunks do not initialize state.
+
+    Categories stay sorted, so final outputs match fit on all received data.
+    Adding categories can change output width AND column positions, including
+    later feature blocks. Re-transform earlier raw data before combining its
+    encoding with newer encodings; old output arrays are not updated in place.
+
+    For b new rows, d features and C learned categories, update time is bounded
+    conservatively by O((b*d+C)*log(b*d+C+1)); working space is O(b*d+C), and
+    stored category state O(C+d), assuming bounded string lengths. Transform
+    takes O(b*d+b*C) time/space including the dense output. Only the feature
+    loop is Python; category discovery/merging and encoding use NumPy.
+    """
+
+    def partial_fit(self, X):
+        """Merge new nonmissing categories into each feature's vocabulary.
+
+        Parameters
+        ----------
+        X : array_like, shape (b, d)
+            New categorical rows, converted to strings. The feature count
+            must match earlier fits. Empty chunks are a no-op after validation.
+
+        Returns
+        -------
+        OneHotEncoder
+            self, with sorted cumulative categories and updated output width.
+
+        Raises
+        ------
+        ValueError
+            If X is not 2-D, has no features or changes the feature count.
+        TypeError
+            If X cannot be converted to strings.
+
+        Notes
+        -----
+        Time: O((b*d+C)*log(b*d+C+1)); temporary space: O(b*d+C), persistent
+        state: O(C+d), with C total categories and bounded string lengths.
+        Missing cells never become categories; no raw chunks are retained.
+        """
+        X = np.asarray(X).astype(str)
+        if X.ndim != 2 or X.shape[1] == 0:
+            raise ValueError("X must be a 2-D array (samples, features) with at least one feature")
+        if hasattr(self, "n_features_in_") and X.shape[1] != self.n_features_in_:
+            raise ValueError(f"expected {self.n_features_in_} features, got {X.shape[1]}")
+        if len(X) == 0:
+            return self
+        if not hasattr(self, "n_features_in_"):
+            return self.fit(X)
+
+        categories = []
+        # Each feature has a different vocabulary, so merge one feature at a time.
+        for column, learned in zip(X.T, self.categories_):
+            present = ~np.isin(column, self.MISSING)
+            categories.append(np.union1d(learned, column[present]))
+        self.categories_ = categories
+        self.n_features_out_ = sum(len(values) for values in categories)
         return self

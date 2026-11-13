@@ -1,4 +1,4 @@
-"""Grouped tests for incremental scalers and missing-value estimates."""
+"""Grouped tests for incremental scaling, imputation and categorical encoding."""
 
 from contextlib import contextmanager
 import warnings
@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from numcompute import preprocessing as batch
-from numcompute_stream.preprocessing import MinMaxScaler, SimpleImputer, StandardScaler
+from numcompute_stream.preprocessing import MinMaxScaler, OneHotEncoder, SimpleImputer, StandardScaler
 
 
 @contextmanager
@@ -239,3 +239,115 @@ def test_numeric_overflow_is_reported_without_corrupting_state():
                     method([[-1e308], [1e308]])
                 np.testing.assert_array_equal(scaler.n_samples_seen_, [2])
                 np.testing.assert_array_equal(scaler.transform([[2.0]]), expected)
+
+
+def test_onehot_expands_sorted_categories_and_matches_batch():
+    X = np.array([["Sydney", "red"], ["Sydney", "blue"], ["Adelaide", "red"],
+                  ["Perth", "green"], ["", "blue"], ["Sydney", ""]])
+    expected = batch.OneHotEncoder().fit_transform(X)
+    for size in (1, 2, 4, 100):
+        with case("onehot chunk size", size=size):
+            encoder = OneHotEncoder()
+            for start in range(0, len(X), size):
+                assert encoder.partial_fit(X[start:start + size]) is encoder
+            assert encoder.n_features_in_ == 2 and encoder.n_features_out_ == 6
+            np.testing.assert_array_equal(encoder.categories_[0], ["Adelaide", "Perth", "Sydney"])
+            np.testing.assert_array_equal(encoder.categories_[1], ["blue", "green", "red"])
+            np.testing.assert_array_equal(encoder.transform(X), expected)
+    # An alphabetically earlier category moves the existing category's column.
+    encoder = OneHotEncoder().partial_fit([["Sydney"]])
+    earlier_output = encoder.transform([["Sydney"]])
+    encoder.partial_fit([["Adelaide"], ["Sydney"]])
+    np.testing.assert_array_equal(earlier_output, [[1.0]])
+    np.testing.assert_array_equal(encoder.transform([["Sydney"]]), [[0.0, 1.0]])
+    encoder.partial_fit([["Sydney"]])
+    assert encoder.n_features_out_ == 2  # Repeated categories do not grow state.
+
+
+def test_onehot_unknown_policy_does_not_prevent_learning_new_categories():
+    for policy in ("error", "ignore"):
+        with case("unknown policy", policy=policy):
+            encoder = OneHotEncoder(handle_unknown=policy).partial_fit([["Sydney"]])
+            if policy == "error":
+                with pytest.raises(ValueError, match="unknown"):
+                    encoder.transform([["Adelaide"]])
+            else:
+                np.testing.assert_array_equal(encoder.transform([["Adelaide"]]), [[0.0]])
+            np.testing.assert_array_equal(encoder.categories_[0], ["Sydney"])
+            encoder.partial_fit([["Adelaide"]])
+            np.testing.assert_array_equal(encoder.transform([["Adelaide"]]), [[1.0, 0.0]])
+            # transform never adds an unknown category to learned state.
+            assert encoder.n_features_out_ == 2
+    with pytest.raises(ValueError):
+        OneHotEncoder(handle_unknown="append")
+
+
+def test_onehot_missing_columns_and_no_categories_recover():
+    missing = np.array([["", "red"], [np.nan, ""], [None, "None"]], dtype=object)
+    for policy in ("error", "ignore"):
+        with case("missing categorical values", policy=policy):
+            encoder = OneHotEncoder(handle_unknown=policy).partial_fit(missing)
+            assert len(encoder.categories_[0]) == 0 and encoder.n_features_out_ == 1
+            np.testing.assert_array_equal(encoder.transform(missing), [[1.0], [0.0], [0.0]])
+            encoder.partial_fit([["Sydney", "blue"]])
+            np.testing.assert_array_equal(encoder.transform(missing), [[0, 0, 1], [0, 0, 0], [0, 0, 0]])
+            np.testing.assert_array_equal(encoder.transform([["Sydney", "blue"]]), [[1, 1, 0]])
+    encoder = OneHotEncoder().partial_fit([[""], [None], [np.nan]])
+    assert encoder.n_features_out_ == 0
+    assert encoder.transform([[""], [None]]).shape == (2, 0)
+    with pytest.raises(ValueError):
+        encoder.transform([["new"]])
+    encoder.partial_fit([["new"]])
+    np.testing.assert_array_equal(encoder.transform([["new"], [""]]), [[1.0], [0.0]])
+
+
+def test_onehot_fit_reset_and_string_conversion_match_original():
+    encoder = OneHotEncoder().partial_fit([["Sydney", "red"]])
+    encoder.partial_fit([["Perth", "blue"]])
+    assert encoder.fit([[2], [10]]) is encoder  # fit can establish a new schema.
+    assert encoder.n_features_in_ == 1 and encoder.n_features_out_ == 2
+    np.testing.assert_array_equal(encoder.categories_[0], ["10", "2"])
+    encoder.partial_fit([[3]])
+    np.testing.assert_array_equal(encoder.transform([[2], [3]]), [[0, 1, 0], [0, 0, 1]])
+    for X in ([[1, 2], [2, 1]], [["", "a"], ["x", "b"]]):
+        with case("fit_transform compatibility", X=X):
+            np.testing.assert_array_equal(encoder.fit_transform(X), batch.OneHotEncoder().fit_transform(X))
+
+
+def test_onehot_empty_and_invalid_chunks_preserve_state():
+    encoder = OneHotEncoder()
+    assert encoder.partial_fit(np.empty((0, 2))) is encoder
+    assert not hasattr(encoder, "n_features_in_")
+    with pytest.raises(RuntimeError):
+        encoder.transform(np.empty((0, 2)))
+    with pytest.raises(ValueError):
+        encoder.fit(np.empty((0, 2)))
+    encoder.partial_fit([["Sydney", "red"]])
+    assert encoder.partial_fit(np.empty((0, 2))) is encoder
+    assert encoder.transform(np.empty((0, 2))).shape == (0, 2)
+    for value in (["Sydney", "red"], np.zeros((1, 1, 2)), np.empty((2, 0)),
+                  [["Sydney"]], np.empty((0, 1)), [["ragged"], ["a", "b"]]):
+        with case("invalid onehot input", value=value):
+            for method in (encoder.partial_fit, encoder.transform):
+                with pytest.raises((ValueError, TypeError)):
+                    method(value)
+            assert encoder.n_features_in_ == 2 and encoder.n_features_out_ == 2
+            np.testing.assert_array_equal(encoder.transform([["Sydney", "red"]]), [[1, 1]])
+    for value in ([], ["Sydney"], np.empty((1, 0))):
+        with case("invalid onehot fit", value=value), pytest.raises(ValueError):
+            encoder.fit(value)
+    assert encoder.n_features_out_ == 2
+
+
+def test_onehot_multiple_features_strides_and_input_ownership():
+    X = np.array([["same", "b"], ["other", "same"], ["same", "same"], ["", "b"]])
+    view = X[::-1, ::-1]
+    saved = view.copy()
+    encoder = OneHotEncoder().partial_fit(view[:2]).partial_fit(view[2:])
+    np.testing.assert_array_equal(encoder.transform(view), batch.OneHotEncoder().fit_transform(view))
+    np.testing.assert_array_equal(view, saved)
+    view[:] = "changed"
+    # Categories own their data, and matching labels in two features stay separate.
+    np.testing.assert_array_equal(encoder.categories_[0], ["b", "same"])
+    np.testing.assert_array_equal(encoder.categories_[1], ["other", "same"])
+    np.testing.assert_array_equal(encoder.transform([["same", "same"]]), [[0, 1, 0, 1]])
