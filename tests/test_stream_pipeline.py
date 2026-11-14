@@ -12,6 +12,32 @@ from numcompute_stream.preprocessing import SimpleImputer, StandardScaler, OneHo
 from numcompute_stream.tree import DecisionTreeClassifier
 
 
+def test_nested_pipelines_keep_incremental_and_batch_call_chains_consistent():
+    imputer, scaler = SimpleImputer(fill_value=0), StandardScaler()
+    inner = Pipeline([("impute", imputer), ("scale", scaler)])
+    model = DecisionTreeClassifier(max_depth=2, buffer_size=3)
+    pipe = Pipeline([("prepare", inner), ("model", model)])
+    manual_imputer, manual_scaler = SimpleImputer(fill_value=0), StandardScaler()
+    manual_model = DecisionTreeClassifier(max_depth=2, buffer_size=3)
+    for X, y in (([[np.nan], [2]], [0, 0]), ([[8], [9]], [1, 1]), ([[1]], [0])):
+        X = np.asarray(X, dtype=float)
+        assert pipe.partial_fit(X, y) is pipe
+        manual_imputer.partial_fit(X)
+        filled = manual_imputer.transform(X)
+        manual_scaler.partial_fit(filled)
+        manual_model.partial_fit(manual_scaler.transform(filled), y)
+    query = np.array([[np.nan], [1.], [9.]])
+    before = scaler.mean_.copy()
+    np.testing.assert_array_equal(pipe.predict(query),
+                                  manual_model.predict(manual_scaler.transform(manual_imputer.transform(query))))
+    np.testing.assert_array_equal(scaler.mean_, before)
+    assert model.n_retrains_ == 1 and model.n_buffered_samples_ == 1
+    assert pipe.fit([[0], [10]], [0, 1]) is pipe
+    assert model.n_retrains_ == 0 and model.n_buffered_samples_ == 0
+    np.testing.assert_array_equal(scaler.n_samples_seen_, [2])
+    np.testing.assert_array_equal(pipe.predict([[0], [10]]), [0, 1])
+
+
 @contextmanager
 def case(name, **options):
     """Identify subcases without expanding the number of pytest functions."""

@@ -6,6 +6,58 @@ import pytest
 from numcompute_stream.tree import DecisionTreeClassifier
 
 
+def test_buffered_label_promotion_cannot_silently_merge_integer_classes():
+    labels = np.array([2**63, 2**63 + 1], dtype=np.uint64)
+    tree = DecisionTreeClassifier(buffer_size=3).partial_fit([[0], [1]], labels)
+    with pytest.raises(TypeError, match="lossless|dtype"):
+        tree.partial_fit([[2]], np.array([-1], dtype=np.int64))
+    assert tree.n_buffered_samples_ == 2 and tree.n_retrains_ == 0
+    np.testing.assert_array_equal(tree._y_buffer[0], labels)
+    tree.partial_fit([[2]], labels[:1])
+    np.testing.assert_array_equal(tree.classes_, labels)
+    np.testing.assert_array_equal(tree.predict([[0], [1]]), labels)
+    # A replacement tree need not share the previous tree's label dtype.
+    tree.partial_fit([[0], [1], [2]], [-1, -1, -1])
+    np.testing.assert_array_equal(tree.classes_, [-1])
+    assert tree.n_retrains_ == 2
+
+
+def test_full_tree_and_unequal_buffers_match_loop_search_for_multiple_streams():
+    from benchmark.stream_loops import LoopDecisionTreeClassifier
+
+    for seed in range(8):
+        rng = np.random.default_rng(seed)
+        X = rng.integers(-2, 3, size=(18, 3)).astype(float)
+        X[rng.random(X.shape) < .2] = np.nan
+        y = rng.integers(0, 3, size=len(X))
+        query = rng.normal(size=(9, 3))
+        query[rng.random(query.shape) < .2] = np.nan
+        for criterion in ("gini", "entropy"):
+            for threshold in (1, 7, 100):
+                tree = DecisionTreeClassifier(max_depth=3, criterion=criterion, buffer_size=threshold)
+                pending_X, pending_y, reference, retrains = [], [], None, 0
+                start = 0
+                for size in (2, 1, 8, 4, 3):
+                    stop = start + size
+                    pending_X.append(X[start:stop])
+                    pending_y.append(y[start:stop])
+                    tree.partial_fit(X[start:stop], y[start:stop])
+                    count = sum(len(chunk) for chunk in pending_y)
+                    if count >= threshold:
+                        reference = LoopDecisionTreeClassifier(max_depth=3, criterion=criterion).fit(
+                            np.vstack(pending_X), np.concatenate(pending_y))
+                        pending_X, pending_y = [], []
+                        retrains += 1
+                    assert tree.n_buffered_samples_ == sum(len(chunk) for chunk in pending_y)
+                    assert tree.n_retrains_ == retrains
+                    if reference is None:
+                        with pytest.raises(RuntimeError):
+                            tree.predict(query)
+                    else:
+                        np.testing.assert_array_equal(tree.predict(query), reference.predict(query))
+                    start = stop
+
+
 @pytest.fixture
 def simple_data():
     return np.array([[0.0], [1.0], [2.0], [3.0]]), np.array([0, 0, 1, 1])

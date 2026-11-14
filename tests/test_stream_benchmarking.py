@@ -8,6 +8,22 @@ from numcompute_stream import benchmarking as bench
 from numcompute_stream.tree import DecisionTreeClassifier
 
 
+def test_buffer_order_repeats_short_scoring_tail_and_input_ownership():
+    X = np.arange(22.).reshape(11, 2)[::-1, ::-1]
+    y = np.arange(11) % 2
+    saved_X, saved_y = X.copy(), y.copy()
+    first = bench.benchmark_buffers(X, y, (2, 7), chunk_size=3, repeat=1, max_depth=2)
+    reverse = bench.benchmark_buffers(X, y, (7, 2), chunk_size=3, repeat=2, max_depth=2)
+    for left, right in zip(first, reverse[::-1]):
+        for key in ("buffer_size", "accuracy", "n_scored", "n_retrains", "pending_samples"):
+            assert left[key] == right[key]
+        assert left["n_scored"] == 2  # Only the last short chunk is scored.
+    np.testing.assert_array_equal(X, saved_X)
+    np.testing.assert_array_equal(y, saved_y)
+    with pytest.raises(ValueError, match="scored chunk"):
+        bench.benchmark_buffers(X[:9], y[:9], (7,), chunk_size=3, repeat=1)
+
+
 @contextmanager
 def case(name, **options):
     try:

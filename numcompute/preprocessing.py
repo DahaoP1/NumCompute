@@ -12,6 +12,78 @@ from .utils import check_array
 MISSING = ("", "nan", "None")      # string cells treated as missing by SimpleImputer and OneHotEncoder
 
 
+def _column_mean(X):
+    """NaN-skipping means of a 2-D float array; empty columns return NaN.
+
+    Shift by an observed value to preserve tiny constants. If the shift
+    overflows, average scaled values instead. Time/space: O(X.size).
+    """
+    valid = ~np.isnan(X)
+    count = valid.sum(axis=0)
+    reference = np.where(count > 0, X[np.argmax(valid, axis=0), np.arange(X.shape[1])], 0.)
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        centred = np.where(valid, X, reference) - reference
+        mean = reference + np.divide(centred.sum(axis=0), count,
+                                    out=np.zeros(X.shape[1]), where=count > 0)
+        fallback = ~np.isfinite(mean) & (count > 0)
+        if fallback.any():
+            values = np.where(valid[:, fallback], X[:, fallback], 0.)
+            mean[fallback] = np.sum(values / count[fallback], axis=0)
+    return np.where(count > 0, mean, np.nan)
+
+
+def _column_median(X):
+    """NaN-skipping medians of a 2-D float array, without midpoint overflow.
+
+    Empty columns return NaN. Sorting copies input. Time: O(d*n*log(n));
+    space: O(n*d), for X shaped (n, d).
+    """
+    values = np.sort(X, axis=0)
+    count = (~np.isnan(values)).sum(axis=0)
+    columns = np.arange(X.shape[1])
+    lower = values[np.maximum((count - 1) // 2, 0), columns]
+    upper = values[np.maximum(count // 2, 0), columns]
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        total = lower + upper
+        middle = np.where(np.isfinite(total), total / 2., lower / 2. + upper / 2.)
+    return np.where(count > 0, middle, np.nan)
+
+
+def _scale_minmax(X, minimum, data_range, low, high):
+    """Apply the MinMax affine map, repairing overflowing intermediate values.
+
+    X is (n, d); fitted arrays are (d,). Returns a float array of X's shape.
+    True output overflow raises FloatingPointError. Time/space: O(n*d).
+    """
+    width = high - low
+    with np.errstate(over="ignore", invalid="ignore", under="ignore", divide="ignore"):
+        unit = (X - minimum) / data_range
+        result = low + unit * width
+    result = np.where(np.isinf(data_range) & np.isfinite(X), low, result)
+    tiny_unit = (np.abs(unit) < np.finfo(float).tiny) & (X != minimum)
+    repair = np.isfinite(X) & np.isfinite(minimum) & np.isfinite(data_range) & (~np.isfinite(result) | tiny_unit)
+    if repair.any():
+        # Work with power-of-two mantissas only for the exceptional cells.
+        values = X[repair]
+        minima = np.broadcast_to(minimum, X.shape)[repair]
+        ranges = np.broadcast_to(data_range, X.shape)[repair]
+        left, left_exp = np.frexp(values)
+        right, right_exp = np.frexp(minima)
+        exponent = np.maximum(left_exp, right_exp)
+        with np.errstate(under="ignore", over="raise", invalid="raise", divide="raise"):
+            delta = np.ldexp(left, left_exp - exponent) - np.ldexp(right, right_exp - exponent)
+            delta, delta_exp = np.frexp(delta)
+            range_mantissa, range_exp = np.frexp(ranges)
+            width_mantissa, width_exp = np.frexp(width)
+            term, term_exp = np.frexp(delta * width_mantissa / range_mantissa)
+            term_exp = term_exp + delta_exp + exponent + width_exp - range_exp
+            low_mantissa, low_exp = np.frexp(low)
+            exponent = np.maximum(term_exp, low_exp)
+            combined = np.ldexp(term, term_exp - exponent) + np.ldexp(low_mantissa, low_exp - exponent)
+            result[repair] = np.ldexp(combined, exponent)
+    return result
+
+
 def _check_fitted(transformer, X: np.ndarray) -> None:
     """Check fitted state and the number of input features.
 
@@ -208,7 +280,7 @@ class MinMaxScaler:
         Parameters
         ----------
         feature_range : pair of numbers, default (0.0, 1.0)
-            Lower and upper endpoints; the lower endpoint must be smaller.
+            Two real finite endpoints with low < high and a finite interval width.
 
         Returns
         -------
@@ -218,17 +290,25 @@ class MinMaxScaler:
         Raises
         ------
         ValueError
-            If two endpoints cannot be unpacked or low >= high.
-        TypeError
-            If endpoints cannot be compared or the range is not iterable.
+            If endpoints are complex, nonfinite, malformed, unordered or too far apart.
 
         Notes
         -----
         Time and space: O(1).
         """
-        low, high = feature_range
-        if low >= high:
-            raise ValueError(f"feature_range must have low < high, got {feature_range}")
+        if np.iscomplexobj(feature_range):
+            raise ValueError("feature_range must contain real endpoints")
+        try:
+            bounds = np.asarray(feature_range, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("feature_range must contain two numbers") from exc
+        if bounds.shape != (2,) or not np.isfinite(bounds).all():
+            raise ValueError("feature_range must contain two finite endpoints")
+        low, high = bounds
+        with np.errstate(over="ignore"):
+            width = high - low
+        if low >= high or not np.isfinite(width):
+            raise ValueError("feature_range must have finite width and low < high")
         self.feature_range = (low, high)
 
     def fit(self, X: np.ndarray) -> "MinMaxScaler":
@@ -249,7 +329,9 @@ class MinMaxScaler:
         TypeError
             If X cannot be converted to numbers.
         ValueError
-            If X is empty or not two-dimensional.
+            If X is empty, not two-dimensional or contains infinity.
+        FloatingPointError
+            If a fitted range exceeds float64. Existing fitted state is kept.
 
         Notes
         -----
@@ -259,9 +341,13 @@ class MinMaxScaler:
         """
         X = check_array(X, ndim=2)
 
-        self.data_min_ = np.nanmin(X, axis=0)
-        self.data_range_ = np.nanmax(X, axis=0) - self.data_min_
-        self.data_range_[self.data_range_ == 0] = np.inf   # constant column: (x - min) / inf = 0
+        if np.isinf(X).any():
+            raise ValueError("X must not contain infinity; NaN is allowed")
+        minimum = np.nanmin(X, axis=0)
+        with np.errstate(over="raise", invalid="raise", under="ignore"):
+            data_range = np.nanmax(X, axis=0) - minimum
+        self.data_min_ = minimum
+        self.data_range_ = np.where(data_range == 0, np.inf, data_range)
         self.n_features_in_ = X.shape[1]
         return self
 
@@ -287,18 +373,20 @@ class MinMaxScaler:
             Also raised if the feature count differs from fit.
         RuntimeError
             If fit has not been called.
+        FloatingPointError
+            If the final transformed value exceeds float64.
 
         Notes
         -----
         Time and space: O(n_samples * n_features), including the output.
-        Does not refit. New values may fall outside feature_range.
+        Does not refit. New values may fall outside feature_range. Power-of-two
+        scaling repairs overflowing or underflowing intermediate ratios.
         """
         X = check_array(X, ndim=2)
         _check_fitted(self, X)
 
         low, high = self.feature_range
-        unit = (X - self.data_min_) / self.data_range_     # in [0, 1]
-        return low + unit * (high - low)
+        return _scale_minmax(X, self.data_min_, self.data_range_, low, high)
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         """Fit on X and return the transformed training data.
@@ -475,9 +563,9 @@ class SimpleImputer:
             all_nan = np.isnan(X).all(axis=0)
             X_safe = np.where(all_nan, 0.0, X)      # nanmean warns on an all-NaN column
             if self.strategy == "mean":
-                self.statistics_ = np.nanmean(X_safe, axis=0)
+                self.statistics_ = _column_mean(X_safe)
             else:
-                self.statistics_ = np.nanmedian(X_safe, axis=0)
+                self.statistics_ = _column_median(X_safe)
             self.statistics_[all_nan] = self.fill_value
 
         self.n_features_in_ = n_features

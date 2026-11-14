@@ -1,12 +1,128 @@
 """Grouped correctness and edge-case checks for streamed evaluation metrics."""
 
 from contextlib import contextmanager
-
 import numpy as np
 import pytest
-
 from numcompute import metrics as batch
 from numcompute_stream import metrics as sm
+
+
+def test_mse_large_finite_mean_and_expired_window_rows():
+    from numcompute import metrics as batch
+    from numcompute_stream import metrics as stream
+
+    with np.errstate(all="raise"):
+        for module in (batch, stream):
+            assert module.mse([2e154, 0, 0, 0], [0, 0, 0, 0]) == pytest.approx(1e308)
+        metric = stream.MSE().update([2e154, 0, 0, 0], [0, 0, 0, 0])
+        assert metric.result() == pytest.approx(1e308)
+        metric.update([0, 0, 0, 0], [0, 0, 0, 0])
+        assert metric.result() == pytest.approx(5e307)
+        rolling = stream.MSE(window_size=4).update([0], [0])
+        rolling.update([2e154, 0, 0, 0], [0, 0, 0, 0])
+        assert rolling.result() == pytest.approx(1e308)
+        expired = stream.MSE(window_size=1).update([1e308, 0], [-1e308, 0])
+        assert expired.result() == 0.0 and expired.n_samples_seen_ == 2
+        before = metric.result()
+        with pytest.raises(FloatingPointError):
+            metric.update([1e308], [-1e308])
+        assert metric.result() == before and metric.n_samples_seen_ == 8
+    for module in (batch, stream):
+        with pytest.raises(FloatingPointError):
+            module.mse([1e308], [-1e308])
+        with pytest.raises(ValueError, match="finite"):
+            module.mse([np.inf], [0])
+
+
+def test_numeric_label_dtype_changes_are_lossless_or_rejected_before_update():
+    from numcompute import metrics as batch
+    from numcompute_stream import metrics as stream
+
+    large = np.array([2**63, 2**63 + 1], dtype=np.uint64)
+    negative = np.array([-1], dtype=np.int64)
+    for window in (None, 3):
+        metric = stream.ConfusionMatrix(window_size=window).update(large, large)
+        with pytest.raises(TypeError, match="lossless|dtype"):
+            metric.update(negative, negative)
+        np.testing.assert_array_equal(metric.labels_, large)
+        np.testing.assert_array_equal(metric.result(), np.eye(2, dtype=int))
+        assert metric.n_samples_seen_ == 2
+        safe = stream.Accuracy(window_size=window).update([0, 1], [0, 1])
+        safe.update(np.array([2.], dtype=float), [2])
+        assert safe.result() == 1 and safe.n_samples_seen_ == 3
+    for module in (batch, stream):
+        with pytest.raises(TypeError, match="lossless|dtype"):
+            module.accuracy(large, large.astype(float))
+        with pytest.raises(TypeError, match="lossless|dtype"):
+            module.confusion_matrix(large, large, labels=np.array([-1., float(2**63)]))
+        np.testing.assert_array_equal(module.confusion_matrix(large, large), np.eye(2, dtype=int))
+
+
+def test_random_prefix_and_window_metrics_against_independent_count_and_pair_oracles():
+    for seed in range(10):
+        rng = np.random.default_rng(seed)
+        truth, pred = rng.integers(0, 4, (2, 40))
+        binary = rng.integers(0, 2, 40)
+        scores = rng.choice([0., .25, .5, .75, 1.], 40)
+        for window in (None, 1, 7, 30):
+            metrics = [sm.Accuracy(window_size=window), sm.Precision(average="macro", window_size=window),
+                       sm.Recall(average="macro", window_size=window), sm.F1(average="macro", window_size=window),
+                       sm.ConfusionMatrix(window_size=window)]
+            curve, area = sm.ROCCurve(window_size=window), sm.AUC(window_size=window)
+            start = 0
+            for size in (1, 5, 2, 17, 15):
+                stop = start + size
+                for metric in metrics:
+                    metric.update(truth[start:stop], pred[start:stop])
+                curve.update(binary[start:stop], scores[start:stop])
+                area.update(binary[start:stop], scores[start:stop])
+                begin = 0 if window is None else max(0, stop - window)
+                t, p = truth[begin:stop].tolist(), pred[begin:stop].tolist()
+                labels = sorted(set(t + p))
+                matrix = np.zeros((len(labels), len(labels)), dtype=int)
+                for actual, predicted in zip(t, p):
+                    matrix[labels.index(actual), labels.index(predicted)] += 1
+                tp = matrix.diagonal()
+                precision = np.divide(tp, matrix.sum(0), out=np.zeros(len(labels)), where=matrix.sum(0) > 0)
+                recall = np.divide(tp, matrix.sum(1), out=np.zeros(len(labels)), where=matrix.sum(1) > 0)
+                f1 = np.divide(2 * precision * recall, precision + recall,
+                               out=np.zeros(len(labels)), where=precision + recall > 0)
+                expected = [sum(a == b for a, b in zip(t, p)) / len(t),
+                            precision.mean(), recall.mean(), f1.mean(), matrix]
+                for metric, answer in zip(metrics, expected):
+                    np.testing.assert_allclose(metric.result(), answer, rtol=0, atol=1e-14)
+                active_y, active_scores = binary[begin:stop], scores[begin:stop]
+                positive, negative = active_scores[active_y == 1], active_scores[active_y == 0]
+                if not len(positive) or not len(negative):
+                    for metric in (curve, area):
+                        with pytest.raises(ValueError):
+                            metric.result()
+                else:
+                    credit = sum(float(a > b) + .5 * float(a == b) for a in positive for b in negative)
+                    assert area.result() == pytest.approx(credit / (len(positive) * len(negative)))
+                    fpr, tpr, thresholds = curve.result()
+                    assert fpr[0] == tpr[0] == 0 and fpr[-1] == tpr[-1] == 1
+                    assert thresholds[0] == np.inf and np.all(thresholds[1:-1] > thresholds[2:])
+                    for fp, tp_rate, threshold in zip(fpr[1:], tpr[1:], thresholds[1:]):
+                        assert fp == np.mean(negative >= threshold)
+                        assert tp_rate == np.mean(positive >= threshold)
+                start = stop
+
+
+def test_auc_large_finite_coordinates_and_scores_under_strict_floats():
+    tiny = np.nextafter(0., 1.)
+    with np.errstate(all="raise"):
+        for module in (batch, sm):
+            assert module.auc([0, 1], [1e308, 1e308]) == pytest.approx(1e308)
+            assert module.auc([-1e308, 1e308], [1e-308, 1e-308]) == pytest.approx(2.)
+            assert module.auc([1e308, -1e308], [1e-308, 1e-308]) == pytest.approx(2.)
+            assert module.auc([0, 1e308], [tiny, 0]) == pytest.approx(tiny * 1e308 / 2, rel=1e-14, abs=0)
+        metric = sm.AUC().update([0], [-1e308]).update([1], [1e308])
+        assert metric.result() == 1.
+    for module in (batch, sm):
+        for x, y in (([0, np.inf], [0, 1]), ([0, 1], [0, -np.inf])):
+            with pytest.raises(ValueError, match="finite"):
+                module.auc(x, y)
 
 
 @contextmanager

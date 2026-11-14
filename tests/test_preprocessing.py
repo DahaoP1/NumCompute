@@ -1,7 +1,33 @@
 import numpy as np
 import pytest
-
 from numcompute.preprocessing import MinMaxScaler, OneHotEncoder, SimpleImputer, StandardScaler
+
+
+def test_minmax_finite_bounds_and_extreme_finite_scaling_regressions():
+    from numcompute.preprocessing import MinMaxScaler, SimpleImputer
+
+    tiny = np.nextafter(0., 1.)
+    for bounds in ((np.nan, 1), (0, np.nan), (-np.inf, 1), (0, np.inf),
+                   (-1e308, 1e308), np.array([0 + 1j, 1 + 2j])):
+        with np.errstate(all="raise"), pytest.raises(ValueError):
+            MinMaxScaler(bounds)
+    with np.errstate(all="raise"):
+        assert MinMaxScaler().fit([[-1e308], [0.]]).transform([[1e308]])[0, 0] == 2.
+        narrow = MinMaxScaler((0, 1e-308)).fit([[0.], [1e-308]])
+        np.testing.assert_allclose(narrow.transform([[1e308]]), [[1e308]])
+        wide = MinMaxScaler((-1e308, 0)).fit([[0.], [1.]])
+        np.testing.assert_allclose(wide.transform([[2.]]), [[1e308]])
+        large_range = MinMaxScaler((0, 1e308)).fit([[0.], [1e308]])
+        assert large_range.transform([[1e-308]])[0, 0] == pytest.approx(1e-308, rel=1e-14, abs=0)
+        for value in (tiny, 1e308):
+            filled = SimpleImputer(strategy="median").fit_transform([[value], [value], [np.nan]])
+            np.testing.assert_array_equal(filled, np.full((3, 1), value))
+    scaler = MinMaxScaler().fit([[0], [1]])
+    for X in ([[-1e308], [1e308]], [[np.inf]]):
+        with pytest.raises((FloatingPointError, ValueError)):
+            scaler.fit(X)
+        np.testing.assert_array_equal(scaler.data_min_, [0])
+        np.testing.assert_array_equal(scaler.data_range_, [1])
 
 
 @pytest.fixture

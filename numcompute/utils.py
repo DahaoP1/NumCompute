@@ -128,6 +128,8 @@ def check_array(X, ndim: int = None) -> np.ndarray:
     -----
     Time/space: O(N) if conversion allocates, otherwise O(1), N=X.size.
     """
+    if np.iscomplexobj(X):
+        raise TypeError("X must contain real numeric values")
     try:
         X = np.asarray(X, dtype=float)
     except (TypeError, ValueError):
@@ -181,29 +183,22 @@ def iter_batches(X: np.ndarray, batch_size: int):
 
 # ---- Jose: numerically stable activations and distances ----
 
-def _safe_max(x: np.ndarray, axis) -> np.ndarray:
-    """Per-slice maximum used as a shift, replaced by 0 where it is not finite.
+def _shifted_exp(x, axis):
+    """Return exponentials and maxima, masking nonfinite slices before exp.
 
-    Parameters
-    ----------
-    x : ndarray of float
-        Input values.
-    axis : int or None
-        Axis of the maximum; the result keeps it with length 1.
-
-    Returns
-    -------
-    ndarray of float
-        Shift that broadcasts against x. A slice that is all -inf, contains
-        +inf or contains NaN gets 0, so subtracting it never creates inf - inf.
-
-    Notes
-    -----
-    Time Complexity: O(N), N=x.size.
-    Space Complexity: O(N / size of the reduced axis) for the result.
+    x is a nonempty float array; axis follows NumPy reduction semantics.
+    Returns (exponentials of x's shape, maxima with reduced axes retained).
+    Invalid axes raise ValueError. Time and space: O(x.size).
     """
-    shift = np.max(x, axis=axis, keepdims=True)
-    return np.where(np.isfinite(shift), shift, 0.0)
+    maximum = np.max(x, axis=axis, keepdims=True)
+    finite = np.isfinite(maximum)
+    shifted = np.full_like(x, -np.inf)
+    # A very negative difference may become -inf, whose exponential is zero.
+    with np.errstate(over="ignore", under="ignore"):
+        np.subtract(x, np.where(finite, maximum, 0.), out=shifted,
+                    where=np.broadcast_to(finite, x.shape))
+        exponentials = np.exp(shifted)
+    return exponentials, maximum
 
 
 def logsumexp(x: ArrayLike, axis: int = None):
@@ -244,9 +239,11 @@ def logsumexp(x: ArrayLike, axis: int = None):
     1000.6931471805599
     """
     x = check_array(x)
-    shift = _safe_max(x, axis)
-    with np.errstate(divide="ignore"):         # log(0) = -inf is the right answer
-        out = np.log(np.sum(np.exp(x - shift), axis=axis, keepdims=True)) + shift
+    exponentials, maximum = _shifted_exp(x, axis)
+    finite = np.isfinite(maximum)
+    logged = np.zeros_like(maximum)
+    np.log(np.sum(exponentials, axis=axis, keepdims=True), out=logged, where=finite)
+    out = np.where(finite, logged + np.where(finite, maximum, 0.), maximum)
 
     if axis is None:
         return float(out.reshape(()))
@@ -292,9 +289,10 @@ def softmax(x: ArrayLike, axis: int = -1) -> np.ndarray:
     array([0.5, 0.5])
     """
     x = check_array(x)
-    exp = np.exp(x - _safe_max(x, axis))
-    with np.errstate(invalid="ignore"):       # 0/0 and inf/inf give NaN, as documented
-        return exp / np.sum(exp, axis=axis, keepdims=True)
+    exp, _ = _shifted_exp(x, axis)
+    total = np.sum(exp, axis=axis, keepdims=True)
+    with np.errstate(under="ignore"):
+        return np.divide(exp, total, out=np.full_like(x, np.nan), where=total > 0)
 
 
 def sigmoid(x: ArrayLike):
@@ -334,7 +332,8 @@ def sigmoid(x: ArrayLike):
     0.0
     """
     x = check_array(x)
-    z = np.exp(-np.abs(x))
+    with np.errstate(under="ignore"):
+        z = np.exp(-np.abs(x))
     out = np.where(x >= 0, 1.0 / (1.0 + z), z / (1.0 + z))
 
     if out.ndim == 0:
@@ -345,11 +344,9 @@ def sigmoid(x: ArrayLike):
 def pairwise_distances(X: ArrayLike, Y: ArrayLike = None) -> np.ndarray:
     """Euclidean distance between every row of X and every row of Y.
 
-    Expands ||x - y||^2 = ||x||^2 + ||y||^2 - 2 x.y, so the work is one
-    matrix product instead of an (n, m, d) array of differences. Both inputs
-    are first centred on X's column means (distances do not change under a
-    shared shift), which limits cancellation for data far from the origin;
-    rounding below zero is clipped before the square root.
+    Accumulates coordinate differences with hypot, vectorised over all pairs.
+    A feature loop avoids an (n, m, d) temporary. Direct differences preserve
+    small distances on mixed-scale data; hypot avoids squaring overflow.
 
     Parameters
     ----------
@@ -388,13 +385,73 @@ def pairwise_distances(X: ArrayLike, Y: ArrayLike = None) -> np.ndarray:
     if X.shape[1] != Y.shape[1]:
         raise ValueError(f"X and Y need the same number of features, got {X.shape[1]} and {Y.shape[1]}")
 
-    centre = X.mean(axis=0)
-    Xc, Yc = X - centre, Y - centre
-    sq = (Xc ** 2).sum(axis=1)[:, None] + (Yc ** 2).sum(axis=1)[None, :] - 2.0 * (Xc @ Yc.T)
-    np.maximum(sq, 0.0, out=sq)               # rounding can leave tiny negatives
+    distances = np.zeros((len(X), len(Y)))
+    with np.errstate(under="ignore"):
+        for left, right in zip(X.T, Y.T):
+            np.hypot(distances, left[:, None] - right[None, :], out=distances)
     if same:
-        np.fill_diagonal(sq, 0.0)
-    return np.sqrt(sq)
+        np.fill_diagonal(distances, 0.0)
+    return distances
+
+
+def _check_label_precision(*arrays):
+    """Reject numeric label promotion that would change integer values.
+
+    Arrays have real numeric or string dtypes. Returns None, or raises
+    TypeError for lossy promotion. Time/space: O(total label count).
+    """
+    dtype = np.result_type(*(array.dtype for array in arrays))
+    if dtype.kind != "f":
+        return
+    for array in arrays:
+        if array.dtype.kind in "iu":
+            with np.errstate(all="ignore"):
+                restored = array.astype(dtype).astype(array.dtype)
+            if not np.array_equal(array, restored):
+                raise TypeError("numeric labels need a consistent dtype; promotion must be lossless")
+
+
+def _mean_square(errors):
+    """Mean square of a nonempty finite residual array, scaling before squaring.
+
+    Returns a float. Unrepresentable results raise FloatingPointError.
+    Time/space: O(errors.size). Tiny squared errors may round to zero.
+    """
+    with np.errstate(over="ignore", under="ignore"):
+        squared = np.square(errors)
+    if np.isfinite(squared).all():
+        with np.errstate(under="ignore"):
+            return float(np.sum(squared / errors.size))
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        scaled = errors / np.sqrt(errors.size)
+        return float(np.sum(np.square(scaled)))
+
+
+def _trapezoid_area(x, y):
+    """Signed trapezoid sum for finite 1-D arrays of equal length >= 2.
+
+    Power-of-two scaling avoids overflow in widths and endpoint sums.
+    Returns a float; unrepresentable results raise FloatingPointError.
+    Time/space: O(len(x)). Tiny final areas may round to zero.
+    """
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        x_mantissa, x_exponent = np.frexp(x)
+        x_exponent = np.where(x_mantissa == 0, -1074, x_exponent)
+        x_scale = np.maximum(x_exponent[1:], x_exponent[:-1])
+        width = (np.ldexp(x_mantissa[1:], x_exponent[1:] - x_scale)
+                 - np.ldexp(x_mantissa[:-1], x_exponent[:-1] - x_scale))
+        width, width_exponent = np.frexp(width)
+        y_mantissa, y_exponent = np.frexp(y)
+        y_exponent = np.where(y_mantissa == 0, -1074, y_exponent)
+        y_scale = np.maximum(y_exponent[1:], y_exponent[:-1])
+        midpoint = (np.ldexp(y_mantissa[1:], y_exponent[1:] - y_scale)
+                    + np.ldexp(y_mantissa[:-1], y_exponent[:-1] - y_scale)) / 2.
+        midpoint, midpoint_exponent = np.frexp(midpoint)
+        terms = width * midpoint
+        exponents = x_scale + width_exponent + y_scale + midpoint_exponent
+        scale = np.max(np.where(terms != 0, exponents, 0))
+        total = np.sum(np.ldexp(terms, exponents - scale))
+        return float(np.ldexp(total, scale))
 
 
 if __name__ == "__main__":

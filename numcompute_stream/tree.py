@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from numbers import Integral
 
 import numpy as np
+from numcompute.utils import _check_label_precision
 
 __all__ = ["DecisionTreeClassifier"]
 
@@ -329,7 +330,8 @@ class DecisionTreeClassifier:
             unchanged across chunks. A correctly shaped empty chunk is a no-op.
         y_chunk : array_like, shape (n_samples,)
             Matching finite numeric/boolean or nonblank string labels. New
-            classes are allowed within the existing numeric or text family.
+            classes are allowed within the existing numeric or text family. Numeric
+            dtype changes must preserve every buffered label exactly.
 
         Returns
         -------
@@ -340,7 +342,7 @@ class DecisionTreeClassifier:
         Raises
         ------
         TypeError
-            If features/labels have unsupported types or label families change.
+            If types/families are incompatible or buffered label promotion is lossy.
         ValueError
             If shapes, feature count, max_features or values are invalid.
 
@@ -362,6 +364,7 @@ class DecisionTreeClassifier:
             return self
         if hasattr(self, "_label_family") and family != self._label_family:
             raise TypeError("y_chunk must keep the same numeric or string label family")
+        _check_label_precision(*self._y_buffer, y)
         X, y = X.copy(), y.copy()
         n_buffered = self.n_buffered_samples_ + len(y)
         if n_buffered >= self.buffer_size:

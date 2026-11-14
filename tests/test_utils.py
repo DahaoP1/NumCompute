@@ -1,8 +1,6 @@
 from itertools import count
-
 import numpy as np
 import pytest
-
 from numcompute.utils import (
     check_array,
     iter_batches,
@@ -12,6 +10,41 @@ from numcompute.utils import (
     sigmoid,
     softmax,
 )
+
+
+def test_distance_mixed_scales_tiny_values_and_large_finite_norms():
+    from numcompute.utils import pairwise_distances
+
+    with np.errstate(all="raise"):
+        for magnitude in (1e9, 1e150, 1e300):
+            X = np.array([[0., 0.], [magnitude, 0.], [magnitude, 1.]])
+            assert pairwise_distances(X)[1, 2] == 1.0
+            assert pairwise_distances(X[:2], X[2:])[1, 0] == 1.0
+            np.testing.assert_array_equal(pairwise_distances(X[1:, ::-1]), [[0, 1], [1, 0]])
+        assert pairwise_distances([[0.]], [[1e-200]])[0, 0] == 1e-200
+        np.testing.assert_allclose(pairwise_distances([[0., 0.]], [[1e200, 1e200]]),
+                                   [[np.sqrt(2.) * 1e200]])
+    with pytest.raises(TypeError, match="real"):
+        pairwise_distances(np.array([[1 + 2j]]))
+
+
+def test_logsumexp_and_softmax_mixed_infinite_slices_under_strict_floats():
+    from numcompute.utils import logsumexp, sigmoid, softmax
+
+    X = np.array([[np.inf, 1000.], [-np.inf, -np.inf], [np.nan, 1000.],
+                  [1000., -1000.], [1e308, -1e308]])
+    with np.errstate(all="raise"):
+        expected = [np.inf, -np.inf, np.nan, 1000., 1e308]
+        np.testing.assert_array_equal(logsumexp(X, axis=1), expected)
+        np.testing.assert_array_equal(logsumexp(X.T, axis=0), expected)
+        assert logsumexp([np.inf, 1000.]) == np.inf
+        assert logsumexp([-np.inf, -np.inf]) == -np.inf
+        assert np.isnan(logsumexp([np.nan, 1000.]))
+        probabilities = softmax(X, axis=1)
+        assert np.isnan(probabilities[:3]).all()
+        np.testing.assert_array_equal(probabilities[3:], [[1, 0], [1, 0]])
+        np.testing.assert_array_equal(softmax(X.T, axis=0), probabilities.T)
+        np.testing.assert_array_equal(sigmoid([-np.inf, -1000., 1000., np.inf]), [0, 0, 1, 1])
 
 
 def test_check_array_converts_to_float64_without_copying_float64():

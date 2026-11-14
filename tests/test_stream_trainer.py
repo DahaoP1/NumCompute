@@ -13,6 +13,62 @@ from numcompute_stream.stream import StreamTrainer, _memory_bytes
 from numcompute_stream.tree import DecisionTreeClassifier
 
 
+def test_csv_chunks_real_pipeline_prequential_scoring_and_saved_plots(tmp_path):
+    from numcompute.io import iter_csv_chunks, load_csv, read_header
+    from numcompute_stream import visualise
+    import matplotlib.pyplot as plt
+
+    csv = tmp_path / "stream.csv"
+    csv.write_text("age,income,city\n10,100,A\n12,NULL,A\n30,900,B\n32,1000,B\n"
+                   "11,N/A,A\n31,950,B\n13,120,A\n33,1100,B\n14,NA,A\n34,1200,B\n", encoding="utf-8")
+    np.testing.assert_array_equal(read_header(csv), ["age", "income", "city"])
+    chunks = list(iter_csv_chunks(csv, chunk_size=2))
+    np.testing.assert_array_equal(np.vstack(chunks), load_csv(csv))
+    numeric_chunks = list(iter_csv_chunks(csv, chunk_size=2, usecols=["age", "income"], dtype=float))
+    assert np.isnan(np.vstack(numeric_chunks)).sum() == 3
+    imputer = SimpleImputer(fill_value=0)
+    tree = DecisionTreeClassifier(max_depth=2, buffer_size=3)
+    pipe = Pipeline([("impute", imputer), ("tree", tree)])
+    trainer = StreamTrainer(pipe, metrics={"recent": metrics.Accuracy(window_size=3),
+                                           "confusion": metrics.ConfusionMatrix(),
+                                           "f1": metrics.F1(average="macro")})
+    truths, predictions, history, correct = [], [], [], 0
+    for number, (chunk, X) in enumerate(zip(chunks, numeric_chunks)):
+        y = chunk[:, 2]
+        if number >= 2:
+            root, seen = tree.root_, imputer.n_samples_seen_.copy()
+            prediction = pipe.predict(X)
+            row = trainer.score_chunk(X, y)
+            truths.extend(y.tolist())
+            predictions.extend(prediction.tolist())
+            correct += sum(a == b for a, b in zip(y, prediction))
+            assert row["cumulative_accuracy"] == correct / len(truths)
+            recent = list(zip(truths, predictions))[-3:]
+            assert row["metrics"]["recent"] == sum(a == b for a, b in recent) / len(recent)
+            assert row["metrics"]["confusion"].sum() == len(truths)
+            assert 0 <= row["metrics"]["f1"] <= 1
+            assert tree.root_ is root
+            np.testing.assert_array_equal(imputer.n_samples_seen_, seen)
+            history.append(row["accuracy"])
+        else:
+            history.append(np.nan)  # Preserve the two unscored warm-up chunks.
+        assert trainer.fit_chunk(X, y) is trainer
+    assert trainer.n_trained_samples_ == 10 and trainer.n_scored_samples_ == 6
+    assert tree.n_retrains_ == 2 and tree.n_buffered_samples_ == 2
+    assert tree.n_training_samples_ == 4
+    for name, function, args in (
+        ("history", visualise.plot_metric_over_time, (history,)),
+        ("comparison", visualise.compare_models, (history, history)),
+        ("predictions", visualise.plot_predictions_vs_ground_truth, (truths, predictions)),
+    ):
+        output = tmp_path / "plots" / (name + ".png")
+        fig, ax = function(*args, show=False, save_path=output)
+        fig.canvas.draw()
+        assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert ax.figure is fig
+        plt.close(fig)
+
+
 @contextmanager
 def case(name, **options):
     """Identify variants within grouped test functions."""
@@ -233,3 +289,10 @@ def test_noncontiguous_inputs_and_label_family_errors_are_handled():
     assert recent.n_samples_seen_ == before and trainer.n_score_chunks_ == 1
     # A new trainer can score string labels from a corresponding string model.
     assert StreamTrainer(RecordingModel()).score_chunk([["city"]], ["city"])["accuracy"] == 1
+    recent = metrics.Accuracy()
+    trainer = StreamTrainer(RecordingModel(), metrics={"recent": recent})
+    trainer.score_chunk([[-1]], [-1])
+    with pytest.raises(TypeError, match="lossless|dtype"):
+        trainer.score_chunk(np.array([[2**63 + 1]], dtype=np.uint64), np.array([0], dtype=np.uint64))
+    assert recent.n_samples_seen_ == 1 and trainer.n_score_chunks_ == 1
+    assert trainer.n_scored_samples_ == 1 and len(trainer.logs_) == 1

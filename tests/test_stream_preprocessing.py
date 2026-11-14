@@ -10,6 +10,37 @@ from numcompute import preprocessing as batch
 from numcompute_stream.preprocessing import MinMaxScaler, OneHotEncoder, SimpleImputer, StandardScaler
 
 
+def test_strict_float_extremes_keep_finite_imputation_and_scaling():
+    tiny = np.nextafter(0., 1.)
+    for strategy in ("mean", "median"):
+        for value in (tiny, 1e308):
+            with np.errstate(all="raise"):
+                imputer = SimpleImputer(strategy=strategy).partial_fit([[value]])
+                imputer.partial_fit([[value], [np.nan]])
+                np.testing.assert_array_equal(imputer.statistics_, [value])
+                np.testing.assert_array_equal(imputer.transform([[np.nan]]), [[value]])
+                np.testing.assert_array_equal(imputer.n_samples_seen_, [2])
+    with np.errstate(all="raise"):
+        opposite = SimpleImputer().partial_fit([[1e308]])
+        opposite.partial_fit([[-1e308], [-1e308], [-1e308]])
+        np.testing.assert_allclose(opposite.statistics_, [-5e307])
+        mixed = SimpleImputer().fit([[1e308], [-1e308], [1e308]])
+        np.testing.assert_allclose(mixed.statistics_, [1e308 / 3])
+        scaler = MinMaxScaler().partial_fit([[-1e308]]).partial_fit([[0.]])
+        np.testing.assert_array_equal(scaler.transform([[1e308]]), [[2.]])
+        np.testing.assert_array_equal(scaler.n_samples_seen_, [2])
+        large_range = MinMaxScaler((0, 1e308)).fit([[0], [1e308]])
+        assert large_range.transform([[1e-308]])[0, 0] == pytest.approx(1e-308, rel=1e-14, abs=0)
+        for bounds in ((0, 1e-308), (-1e308, 0)):
+            train = [[0.], [1e-308]] if bounds[0] == 0 else [[0.], [1.]]
+            test = [[1e308]] if bounds[0] == 0 else [[2.]]
+            np.testing.assert_allclose(MinMaxScaler(bounds).fit(train).transform(test), [[1e308]])
+    with pytest.raises(ValueError):
+        MinMaxScaler(np.array([0 + 1j, 1 + 2j]))
+    with pytest.raises(FloatingPointError):
+        MinMaxScaler((0, 1e308)).fit([[0], [1]]).transform([[2]])
+
+
 @contextmanager
 def case(name, **parameters):
     """Keep grouped failures identifiable without multiplying pytest cases."""

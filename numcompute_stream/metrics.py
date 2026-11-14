@@ -3,6 +3,7 @@
 Classification metrics take 1-D label arrays (int, float, bool or str labels).
 Precision, recall and F1 are all computed from one confusion matrix, so they
 share the same counts. Scalar results are returned as Python floats.
+Numeric label dtype changes must be lossless; otherwise TypeError is raised.
 
 Extended from numcompute.metrics: the original eight functions and input
 checking helpers are kept below. Stateful classes add update/reset/result
@@ -14,6 +15,7 @@ from collections.abc import Sequence
 from numbers import Integral
 
 import numpy as np
+from numcompute.utils import _check_label_precision, _mean_square, _trapezoid_area
 
 # All that can be imported from this module
 __all__ = [
@@ -336,13 +338,15 @@ def mse(
     TypeError
         If an input is not numeric.
     ValueError
-        If an input is not 1-D, is empty or contains NaN, or the lengths differ.
+        If an input is not 1-D, is empty or nonfinite, or the lengths differ.
+    FloatingPointError
+        If the mean square is outside float64 range.
 
     Notes
     -----
     Time Complexity: O(n: number of samples).
     Space Complexity: O(n) for the difference array.
-    Divide squared errors before their sum to avoid unnecessary overflow.
+    Scale residuals before squaring when their individual squares overflow.
 
     Examples
     --------
@@ -353,9 +357,10 @@ def mse(
     y_pred = _check_values(y_pred, "y_pred")
     _check_same_length(y_true, y_pred, ("y_true", "y_pred"))
 
-    squared = np.square(y_true - y_pred)
-    # Divide before summing so representable mean errors do not overflow.
-    return float(np.sum(squared / squared.size))
+    if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
+        raise ValueError("mse inputs must be finite")
+    with np.errstate(over="raise", invalid="raise", under="ignore"):
+        return _mean_square(y_true - y_pred)
 
 
 def roc_curve(
@@ -480,13 +485,15 @@ def auc(
         If an input is not numeric.
     ValueError
         If an input is not 1-D, contains NaN or has fewer than 2 points; the
-        lengths differ; or ``x`` is not monotonic.
+        lengths differ; an input is nonfinite; or ``x`` is not monotonic.
+    FloatingPointError
+        If the final area is outside float64 range.
 
     Notes
     -----
     Time Complexity: O(m: number of points).
     Space Complexity: O(m).
-    Written out instead of ``np.trapz``, which NumPy 2 renamed to ``np.trapezoid``.
+    Power-of-two scaling avoids overflow in widths and endpoint sums.
 
     Examples
     --------
@@ -497,18 +504,18 @@ def auc(
     y = _check_values(y, "y")
     _check_same_length(x, y, ("x", "y"))
 
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("auc coordinates must be finite")
+
     if x.size < 2:
         raise ValueError(f"auc needs at least 2 points, got {x.size}")
 
-    dx = np.diff(x)
-
-    if (dx < 0).any() and (dx > 0).any():
+    decreases = x[1:] < x[:-1]
+    increases = x[1:] > x[:-1]
+    if decreases.any() and increases.any():
         raise ValueError("x must be monotonic (all increasing or all decreasing)")
-
-    direction = -1.0 if (dx < 0).any() else 1.0
-    area = np.sum(dx * (y[1:] + y[:-1]) / 2)
-
-    return float(direction * area)
+    direction = -1.0 if decreases.any() else 1.0
+    return float(direction * _trapezoid_area(x, y))
 
 
 def _check_labels(
@@ -698,11 +705,11 @@ def _check_same_family(
     Raises
     ------
     TypeError
-        If one vector holds numeric labels and the other holds text labels.
+        If label families differ or numeric dtype promotion would change a label.
 
     Notes
     -----
-    Time and space: O(1).
+    Time and space: O(n + m) for numeric precision checks.
     """
     # Check if both arrays hold the same family of labels: NumPy would compare 1 with "1" as unequal
     # (or silently promote 1 to "1"), giving wrong scores instead of an error
@@ -710,6 +717,7 @@ def _check_same_family(
         raise TypeError(
             f"{names[0]} ({a.dtype}) and {names[1]} ({b.dtype}) hold labels of incompatible types"
         )
+    _check_label_precision(a, b)
 
 
 def _check_pos_label(
@@ -835,6 +843,7 @@ def _label_index(
     -----
     Time: O(k * log(k) + n * log(k)); space O(n + k).
     """
+    _check_label_precision(y, classes)
     order = np.argsort(classes, kind="stable")
     sorted_classes = classes[order]
 
@@ -1198,6 +1207,8 @@ class ConfusionMatrix:
         if len(self.labels_):
             _check_same_family(y_true, self.labels_, ("y_true", "previous labels"))
         chunk_classes = _resolve_labels(y_true, y_pred, self._labels)
+        if len(self.labels_):
+            _check_label_precision(self.labels_, chunk_classes)
 
         if self.window_size is not None:
             active_true = y_true if self._true is None else np.concatenate((self._true, y_true))
@@ -1415,7 +1426,7 @@ class MSE:
 
     Notes
     -----
-    Cumulative state takes O(1) memory. Window state keeps O(W) squared errors.
+    Cumulative state takes O(1) memory. Window state keeps O(W) residuals.
     Finite 1-D numeric targets/predictions are required; missing rows must be
     filtered beforehand. Queries do not modify state.
     """
@@ -1481,13 +1492,13 @@ class MSE:
         TypeError, ValueError
             If types, dimensions, lengths or finite-value checks fail.
         FloatingPointError
-            If squared errors overflow float64; rescale targets. State is kept.
+            If residuals or mean square exceed float64; rescale targets. State is kept.
 
         Notes
         -----
         Cumulative update time/temporary space O(b), state O(1). Window mode
-        takes O(b+W) time/temporary space and O(W) state. Dividing before sums
-        avoids overflow from summing otherwise representable squared errors.
+        takes O(b+W) time/temporary space and O(W) state. Scaling before squaring
+        avoids unnecessary overflow. Expired rows are dropped before subtraction.
         """
         y_true, y_pred = _check_stream_pair(y_true, y_pred, numeric=True)
         if len(y_true) == 0:
@@ -1498,10 +1509,11 @@ class MSE:
                 batch_mean = mse(y_true, y_pred)  # Original MSE function, now with a stable sum.
                 mean = self._mean * (self.n_samples_ / count) + batch_mean * (len(y_true) / count)
             else:
-                squared = (y_true - y_pred) ** 2
-                errors = np.concatenate((self._errors, squared))[-self.window_size:].copy()
+                # Discard expired rows before doing potentially large subtraction.
+                residuals = y_true[-self.window_size:] - y_pred[-self.window_size:]
+                errors = np.concatenate((self._errors, residuals))[-self.window_size:].copy()
                 count = len(errors)
-                mean = np.sum(errors / count)
+                mean = _mean_square(errors)
         self._mean, self.n_samples_ = float(mean), count
         self.n_samples_seen_ += len(y_true)
         if self.window_size is not None:

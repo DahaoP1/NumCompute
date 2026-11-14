@@ -3,11 +3,13 @@
 Classification metrics take 1-D label arrays (int, float, bool or str labels).
 Precision, recall and F1 are all computed from one confusion matrix, so they
 share the same counts. Scalar results are returned as Python floats.
+Numeric label dtype changes must be lossless; otherwise TypeError is raised.
 """
 
 from collections.abc import Sequence
 
 import numpy as np
+from .utils import _check_label_precision, _mean_square, _trapezoid_area
 
 # All that can be imported from this module
 __all__ = [
@@ -328,7 +330,9 @@ def mse(
     TypeError
         If an input is not numeric.
     ValueError
-        If an input is not 1-D, is empty or contains NaN, or the lengths differ.
+        If an input is not 1-D, is empty or nonfinite, or the lengths differ.
+    FloatingPointError
+        If the mean square is outside float64 range.
 
     Notes
     -----
@@ -344,7 +348,10 @@ def mse(
     y_pred = _check_values(y_pred, "y_pred")
     _check_same_length(y_true, y_pred, ("y_true", "y_pred"))
 
-    return float(np.mean(np.square(y_true - y_pred)))
+    if not np.isfinite(y_true).all() or not np.isfinite(y_pred).all():
+        raise ValueError("mse inputs must be finite")
+    with np.errstate(over="raise", invalid="raise", under="ignore"):
+        return _mean_square(y_true - y_pred)
 
 
 def roc_curve(
@@ -469,13 +476,15 @@ def auc(
         If an input is not numeric.
     ValueError
         If an input is not 1-D, contains NaN or has fewer than 2 points; the
-        lengths differ; or ``x`` is not monotonic.
+        lengths differ; an input is nonfinite; or ``x`` is not monotonic.
+    FloatingPointError
+        If the final area is outside float64 range.
 
     Notes
     -----
     Time Complexity: O(m: number of points).
     Space Complexity: O(m).
-    Written out instead of ``np.trapz``, which NumPy 2 renamed to ``np.trapezoid``.
+    Power-of-two scaling avoids overflow in widths and endpoint sums.
 
     Examples
     --------
@@ -486,18 +495,18 @@ def auc(
     y = _check_values(y, "y")
     _check_same_length(x, y, ("x", "y"))
 
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValueError("auc coordinates must be finite")
+
     if x.size < 2:
         raise ValueError(f"auc needs at least 2 points, got {x.size}")
 
-    dx = np.diff(x)
-
-    if (dx < 0).any() and (dx > 0).any():
+    decreases = x[1:] < x[:-1]
+    increases = x[1:] > x[:-1]
+    if decreases.any() and increases.any():
         raise ValueError("x must be monotonic (all increasing or all decreasing)")
-
-    direction = -1.0 if (dx < 0).any() else 1.0
-    area = np.sum(dx * (y[1:] + y[:-1]) / 2)
-
-    return float(direction * area)
+    direction = -1.0 if decreases.any() else 1.0
+    return float(direction * _trapezoid_area(x, y))
 
 
 def _check_labels(
@@ -668,11 +677,11 @@ def _check_same_family(
     Raises
     ------
     TypeError
-        If one vector holds numeric labels and the other holds text labels.
+        If label families differ or numeric dtype promotion would change a label.
 
     Notes
     -----
-    Time and space: O(1).
+    Time and space: O(n + m) for numeric precision checks.
     """
     # Check if both arrays hold the same family of labels: NumPy would compare 1 with "1" as unequal
     # (or silently promote 1 to "1"), giving wrong scores instead of an error
@@ -680,6 +689,7 @@ def _check_same_family(
         raise TypeError(
             f"{names[0]} ({a.dtype}) and {names[1]} ({b.dtype}) hold labels of incompatible types"
         )
+    _check_label_precision(a, b)
 
 
 def _check_pos_label(
@@ -801,6 +811,7 @@ def _label_index(
     -----
     Time: O(k * log(k) + n * log(k)); space O(n + k).
     """
+    _check_label_precision(y, classes)
     order = np.argsort(classes, kind="stable")
     sorted_classes = classes[order]
 

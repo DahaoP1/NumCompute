@@ -15,6 +15,41 @@ from numcompute_stream import stats
 from numcompute_stream.stats import RunningStats, update_stats
 
 
+def test_all_queries_match_independent_prefix_values_and_reused_batch_functions():
+    # Exact expectations, rather than comparing two copies of the same formula.
+    X = np.array([[1., np.nan], [3., 10.], [5., 20.], [7., 30.]])
+    running = update_stats(X[:1])
+    running.partial_fit(X[1:3]).update_stats(X[3:])
+    with np.errstate(all="raise"):
+        np.testing.assert_array_equal(running.count_, [4, 3])
+        np.testing.assert_array_equal(running.mean, [4, 20])
+        np.testing.assert_allclose(running.m2, [20, 200], rtol=1e-14)
+        np.testing.assert_allclose(running.var(), [5, 200 / 3])
+        np.testing.assert_allclose(running.var(ddof=1), [20 / 3, 100], rtol=1e-14)
+        np.testing.assert_allclose(running.std(), np.sqrt([5, 200 / 3]))
+        np.testing.assert_array_equal(running.min, [1, 10])
+        np.testing.assert_array_equal(running.max, [7, 30])
+        np.testing.assert_array_equal(running.median(), [4, 20])
+        np.testing.assert_array_equal(running.quantile([0, .5, 1]), [[1, 10], [4, 20], [7, 30]])
+        np.testing.assert_array_equal(running.histogram(bins=[0, 10, 20, 30])[0], [4, 1, 2])
+    for name in ("mean", "median", "std", "min", "max", "quantile", "histogram"):
+        assert getattr(stats, name) is getattr(batch_stats, name)
+    # Every reused function is executed, including both explicit axis choices.
+    for axis in (0, None):
+        for name, numpy_name in (("mean", "nanmean"), ("median", "nanmedian"),
+                                 ("std", "nanstd"), ("min", "nanmin"), ("max", "nanmax")):
+            np.testing.assert_allclose(getattr(stats, name)(X, axis=axis, skip_nan=True),
+                                       getattr(np, numpy_name)(X, axis=axis))
+        np.testing.assert_allclose(stats.quantile(X, [.25, .75], axis=axis, skip_nan=True),
+                                   np.nanquantile(X, [.25, .75], axis=axis))
+    tiny = np.nextafter(0., 1.)
+    with np.errstate(all="raise"):
+        for value in (tiny, 1e308):
+            constant = RunningStats(store_data=False).update([value]).update([value])
+            np.testing.assert_array_equal(constant.mean, [value])
+            np.testing.assert_array_equal(constant.var(), [0])
+
+
 @contextmanager
 def _case(name, **parameters):
     """Keep the original exception traceback and add the failing scenario."""

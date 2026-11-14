@@ -287,7 +287,7 @@ The charts are drawn from recorded per-chunk results after the loop; they do not
 
 ## Tests and edge cases
 
-The current suite was verified with **386 passing cases: 212 original and 174 streaming**, exceeding the 30-case streaming requirement. Related checks are grouped in test functions. Run from the root:
+The current suite was verified with **401 passing cases: 215 original and 186 streaming**, exceeding the 30-case streaming requirement. Related checks are grouped in test functions. Run from the root:
 
 ```bash
 python -m pytest tests -q
@@ -296,6 +296,8 @@ python -m pytest tests/test_stream_tree.py -q
 ```
 
 Coverage includes empty chunks, invalid types/shapes, NaNs and all-missing columns, constant columns, duplicate categories, class/split ties, large numeric offsets, overflow rejection and non-contiguous arrays. Streaming checks cover uneven chunk sizes, threshold crossing, oversized chunks, buffer clearing, pending final data, prediction warm-up, reset, rolling sample windows, dynamic classes, pipeline order and log snapshots. Plot tests run headlessly and check file output. Benchmark tests check equal answers and shared scoring rows; they do not require one implementation to be faster. See [tests/README.md](tests/README.md) for coverage by file.
+
+The numerical regression checks include exact unit distances on mixed-scale inputs, nonfinite scaler bounds, mixed infinite `logsumexp` slices, extreme finite imputation/scaling, large MSE/AUC results and lossless label dtype changes. Random prefix/window tests use independent counts and pairwise AUC expectations; buffered trees are checked against loop-based split search. An integration test reads CSV chunks, scores before training through a real pipeline, checks logs and saves all three plot types. Every executable public A2.2 interface is exercised; this does not imply exhaustive coverage of every possible input.
 
 ## Benchmarking and performance table
 

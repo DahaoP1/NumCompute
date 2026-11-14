@@ -10,6 +10,8 @@ import numpy as np
 
 from numcompute.preprocessing import (
     MISSING,
+    _column_mean,
+    _column_median,
     MinMaxScaler as _BatchMinMaxScaler,
     OneHotEncoder as _BatchOneHotEncoder,
     SimpleImputer as _BatchSimpleImputer,
@@ -264,20 +266,7 @@ class MinMaxScaler(_StreamingFit, _BatchMinMaxScaler):
         -----
         Time/space: O(1) for a pair of endpoints.
         """
-        try:
-            bounds = np.asarray(feature_range, dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("feature_range must contain two numbers") from exc
-        if bounds.shape != (2,):
-            raise ValueError("feature_range must contain exactly two numbers")
-        low, high = bounds
-        if not np.isfinite(bounds).all() or low >= high:
-            raise ValueError("feature_range must have two finite endpoints with low < high")
-        with np.errstate(over="ignore"):
-            width = high - low
-        if not np.isfinite(width):
-            raise ValueError("feature_range must have two finite endpoints with finite low < high")
-        super().__init__(tuple(bounds))
+        super().__init__(feature_range)
 
     def _learn(self, X, reset):
         """Merge extrema and counts without retaining rows; O(b*d)."""
@@ -381,15 +370,18 @@ class SimpleImputer(_StreamingFit, _BatchSimpleImputer):
         if self.strategy == "constant":
             statistics = np.full(X.shape[1], self.fill_value)
         elif self.strategy == "mean":
-            # Divide before summing to avoid overflow from summing large values.
-            # Count weights ensure unequal chunks and missing cells are handled.
+            # Keep tiny constants intact; weight unequal chunks by valid counts.
             old_mean = self._mean if previous else np.zeros(X.shape[1])
-            with np.errstate(over="raise", invalid="raise", divide="raise"):
-                batch_mean = np.divide(np.where(missing, 0.0, X), batch_count,
-                                       out=np.zeros_like(X), where=batch_count > 0).sum(axis=0)
-                old_weight = np.divide(old_count, count, out=np.zeros(X.shape[1]), where=count > 0)
+            batch_mean = np.where(batch_count > 0, _column_mean(X), 0.)
+            with np.errstate(over="ignore", invalid="raise", divide="raise", under="ignore"):
                 new_weight = np.divide(batch_count, count, out=np.zeros(X.shape[1]), where=count > 0)
-                mean = old_mean * old_weight + batch_mean * new_weight
+                mean = old_mean + (batch_mean - old_mean) * new_weight
+                # Opposite large means may overflow their difference.
+                repair = ~np.isfinite(mean)
+                if repair.any():
+                    mean[repair] = (old_mean[repair] * (1. - new_weight[repair])
+                                    + batch_mean[repair] * new_weight[repair])
+                mean = np.where(old_count == 0, batch_mean, mean)
             statistics = np.where(count > 0, mean, self.fill_value)
         else:
             chunks = self._chunks + [X.copy()] if previous else [X.copy()]
@@ -397,7 +389,7 @@ class SimpleImputer(_StreamingFit, _BatchSimpleImputer):
             # Avoid warnings for all-NaN columns; they receive the fallback below.
             safe = np.where(count == 0, 0.0, history)
             with np.errstate(over="raise", invalid="raise"):
-                statistics = np.nanmedian(safe, axis=0)
+                statistics = _column_median(safe)
             statistics = np.where(count > 0, statistics, self.fill_value)
         self.statistics_ = statistics
         self.n_samples_seen_, self.n_features_in_ = count, X.shape[1]

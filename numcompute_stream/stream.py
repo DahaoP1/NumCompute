@@ -11,6 +11,7 @@ from time import perf_counter
 from types import ModuleType
 
 import numpy as np
+from numcompute.utils import _check_label_precision
 
 from .metrics import Accuracy, ROCCurve, accuracy, _check_labels, _check_stream_pair, _check_same_family
 from .pipeline import Pipeline
@@ -274,6 +275,7 @@ class StreamTrainer:
         y, prediction = _check_stream_pair(y, prediction)
         if self.n_scored_samples_:
             _check_same_family(y, self._accuracy.labels_, ("y", "previous scored labels"))
+            _check_label_precision(y, prediction, self._accuracy.labels_)
         chunk_accuracy = accuracy(y, prediction)
         results = {}
         for name, metric in self.metrics.items():

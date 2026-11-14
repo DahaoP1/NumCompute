@@ -1,14 +1,24 @@
 """Grouped headless tests for plots, NaN gaps, class axes and file output."""
 
 from contextlib import contextmanager
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
-
 from numcompute_stream import visualise
+
+def test_label_precision_is_validated_before_creating_a_figure():
+    from numcompute_stream.visualise import plot_predictions_vs_ground_truth
+
+    large = np.array([2**63, 2**63 + 1], dtype=np.uint64)
+    before = plt.get_fignums()
+    with pytest.raises(TypeError, match="lossless|dtype"):
+        plot_predictions_vs_ground_truth(large, large.astype(float), show=False)
+    assert plt.get_fignums() == before
+    fig, ax = plot_predictions_vs_ground_truth(large, large, show=False)
+    assert [tick.get_text() for tick in ax.get_yticklabels()] == [str(value) for value in large]
+    plt.close(fig)
 
 
 @pytest.fixture(autouse=True)
