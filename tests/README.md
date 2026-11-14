@@ -1,22 +1,26 @@
-# Unit-test plan
+# Tests
 
-> Required coverage: **at least 20 unit tests**, including edge cases.
+This folder covers both assignments. The suite currently has **386 collected cases**: 212 for the original NumCompute package and 174 for streaming extensions. Related edge cases are grouped in test functions. The old tests remain in place to catch regressions.
 
-Task allocation: testing is shared. Each member writes **3--4 tests for every
-function they implement**, including normal, boundary, invalid-input, and
-numerical-stability cases where applicable.
+From the project root:
 
-| Module               | Implementation owner | Test responsibility                                |
-| -------------------- | -------------------- | -------------------------------------------------- |
-| `io.py`            | Jose                 | Jose writes 3--4 tests per implemented function.   |
-| `preprocessing.py` | Dat                  | Dat writes 3--4 tests per implemented function.    |
-| `sort_search.py`   | Faris                | Faris writes 3--4 tests per implemented function.  |
-| `rank.py`          | Faris                | Faris writes 3--4 tests per implemented function.  |
-| `stats.py`         | Dat                  | Dat writes 3--4 tests per implemented function.    |
-| `metrics.py`       | Jose                 | Jose writes 3--4 tests per implemented function.   |
-| `optim.py`         | Shuhao               | Shuhao writes 3--4 tests per implemented function. |
-| `pipeline.py`      | Shuhao               | Shuhao writes 3--4 tests per implemented function. |
-| `utils.py`         | All members          | Each member tests the utilities they own.          |
-| `benchmarking.py`  | Jose                 | Jose tests deterministic benchmark configuration.  |
+```bash
+python -m pytest tests -q
+python -m pytest tests -q -k test_stream
+python -m pytest tests/test_stream_tree.py -q
+```
 
-Add test files as `test_<module>.py`.
+## Streaming coverage
+
+| File | Main checks |
+| --- | --- |
+| `test_stream_tree.py` | Splits, NaNs, ties, reference loop results, buffer thresholds/clearing, prediction warm-up and pending rows. |
+| `test_stream_preprocessing.py` | Chunk/batch agreement, valid counts, missing/constant columns, category growth, reset and sliced inputs. |
+| `test_stream_stats.py` | Running moments, exact distribution queries, memory mode, overflow rejection and NaN recovery. |
+| `test_stream_metrics.py` | Cumulative and rolling results, class order, zero denominators, binary ROC/AUC and reset. |
+| `test_stream_pipeline.py` | Original batch API, incremental step order, label routing, empty chunks and error propagation. |
+| `test_stream_trainer.py` | Training/scoring separation, weighted accuracy, model readiness, logs and memory estimates. |
+| `test_stream_visualise.py` | Headless figures, NaN gaps, category axes, saving and invalid input. |
+| `test_stream_benchmarking.py` | Matching loop/NumPy results, reproducible inputs, fair buffer scoring and report output. |
+
+Tests do not assert that NumPy must be faster. Timing comparisons belong to the reproducible benchmark runner, not correctness tests. See the [project README](../README.md) for usage, APIs and performance tables.

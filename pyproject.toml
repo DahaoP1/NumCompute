@@ -1,5 +1,4 @@
-# Packaging configuration task allocation: shared by all members.
-# Each member keeps package metadata and tests aligned with their module.
+# Both assignments share this distribution; benchmark runners are included.
 
 [build-system]
 requires = ["setuptools>=64"]
@@ -8,16 +7,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "numcompute"
 version = "0.1.0"
-description = "A NumPy-only scientific computing toolkit: I/O, preprocessing, sort/search, ranking, statistics, metrics, finite-difference gradients and pipelines."
+description = "NumPy scientific computing and buffered decision trees with incremental preprocessing, metrics and matplotlib plots."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.23"]
+dependencies = ["numpy>=1.23", "matplotlib"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
 [tool.setuptools]
-packages = ["numcompute"]
+packages = ["numcompute", "numcompute_stream", "benchmark"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

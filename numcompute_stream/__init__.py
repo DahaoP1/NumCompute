@@ -1,4 +1,6 @@
-"""Streaming extensions for NumCompute.
+"""Incremental preprocessing, statistics, metrics and buffered decision trees.
 
-Assignment 2.2 placeholder; implementation will be added later.
+Use the existing numcompute.io for CSV/chunk input. Stream coordination,
+pipelines, plotting and benchmark helpers live in the corresponding submodules.
+Submodules are imported explicitly so package import stays lightweight.
 """
